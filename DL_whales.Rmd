@@ -1,0 +1,448 @@
+---
+title: "Deep Learning on the whales dataset"
+author: "Nadezhda Gesheva"
+date: '26 06 2018'
+output: html_document
+---
+
+# Whales challenge on Kaggle - image recognition of whale id
+
+## Data visualization
+
+```{r}
+library(tensorflow)
+library(keras)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(EBImage)
+library(ggplot2)
+
+files_train <- list.files(path = "train", pattern=".jpg",
+                    all.files=T, full.names=T)
+
+# Visualize the first 3 elements in the training dataset
+display(readImage(file.path(files_train[1])))
+display(readImage(file.path(files_train[2])))
+display(readImage(file.path(files_train[3])))
+
+```
+
+## Data prep
+
+```{r}
+
+# Read the csv file
+train_data <- read.csv("train.csv", sep = ",")
+
+nrow(train_data) # 9850 observations in total
+# Look at the first 15 observations
+head(train_data, n = 15)
+# The Id's of the observations look very different
+# There is a lable'new_whale', i.e. unknown type
+
+# check the number of unique Ids
+length(unique(train_data$Id)) 
+# we have 4251 unique IDs in the training set
+# If we take out the 'new_whale' label => we have 4250 unique IDs
+```
+
+## Data investigation
+
+```{r}
+train_data <- data.table(train_data)
+train_data <- train_data[, count := .N, by = Id]
+#summary(train_data$count)
+
+# order by the count of unique whale ids
+train_data_sorted <- train_data[order(train_data[["count"]], decreasing = TRUE)]
+train_data_sorted[1:10, 1:3]
+
+# Visualize the distribution of the number of unique ids
+ggplot(data =train_data_sorted, aes(train_data_sorted$count)) + geom_histogram() +
+  xlab("Number of unique sets") + ggtitle("Distribution of unique whale IDs")
+
+# See the distribution but without the 810 observations for 'new_whale'
+train_data_no_extr <- train_data[count < 810,]
+ggplot(data =train_data_no_extr, aes(train_data_no_extr$count)) + 
+  geom_histogram(binwidth = 0.5) + xlab("Number of unique sets") + 
+  ggtitle("Distribution of unique whale IDs without extreme values")
+
+```
+
+
+
+```{r}
+# Continue the analysis of whale ids with more than 2 images(~2500 have only 1 image).
+train_upd <- train_data[count > 1,]
+# new train set has 7630 observations
+
+# number of unique ids in the updated train set is 2031
+length(unique(train_upd$Id))
+
+```
+
+
+## Separate the images into train & validation folders with
+## subfolders the whale id
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+### Train and validation samples
+
+# For validation purposes get only 1 sample per ID; all remaining are left fro training.
+ordered_data <- train_upd[order(train_upd$Id, train_upd$Image),]
+valid_df <- ordered_data[!duplicated(ordered_data$Id),]
+train_df <- ordered_data[duplicated(ordered_data$Id),]
+# Check
+table(train_df$Image =="0031c258.jpg") # not available in the train_df, only in the valid_df.
+
+### Create train and validation directories with subfolders
+### the ids of the whales.
+
+whales_directory <- "~/whales_directory"
+dir.create(whales_directory)
+
+train_directory <- "~/whales_directory/train_directory"
+dir.create(train_directory)
+
+validation_directory <- "~/whales_directory/validation_directory"
+dir.create(validation_directory)
+
+# Create an empty vector with 2031 rows
+dir <- matrix(NA,2031,1)
+
+# populate the train directory with 5599 images
+for (i in 1:(nrow(train_df)))  { 
+  dir[i] <- paste("~/whales_directory/train_directory", train_df$Id[i], sep="/")
+  dir.create(dir[i])
+  file.copy(file.path("~/train", train_df$Image[i]), file.path(dir[i]))
+} 
+
+# populate the validation directory with 2031 images
+for (i in 1:nrow(valid_df))  { 
+  
+  dir[i] <- paste("~/whales_directory/validation_directory", valid_df$Id[i], sep="/")
+  dir.create(dir[i])
+  file.copy(file.path("~/train", valid_df$Image[i]), file.path(dir[i]))
+} 
+
+
+```
+
+
+
+# Models creation
+
+## VGG16 with additional layers
+
+```{r}
+# Use the pretrained VGG16 model from Imagenet
+conv_base <- application_vgg16(
+  weights = "imagenet",
+  include_top = FALSE,
+  input_shape = c(150, 150, 3)
+)
+summary(conv_base)
+
+# Use the VGG16 just like a first layer to the model and then flatten the output and
+# add 2 additional dense layers, where the last one has 2031 units = unique whale ids.
+model <- keras_model_sequential() %>% 
+  conv_base %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 256, activation = "relu") %>% 
+  layer_dense(units = 2031, activation = "softmax")
+
+summary(model)
+
+# Need to freeze the weights of the model so that we keep the original weights of the 
+# pretrained model.
+length(model$trainable_weights) # 30
+freeze_weights(conv_base)
+length(model$trainable_weights) # 4
+
+
+```
+
+## Data Augmentation
+
+```{r}
+### Next - data generator since we dont have enough images per ID
+# Since we dont enough samples for our model to learn from, we might fall into 
+# the issue of overfitting. Hence, we need to augment/reshape/transform the images, so
+# that there would be enough distinctive samples.
+
+train_datagen = image_data_generator(
+  rescale = 1./255,
+  rotation_range = 40,
+  width_shift_range = 0.3,
+  height_shift_range = 0.3,
+  shear_range = 0.3,
+  zoom_range = 0.3,
+  horizontal_flip = TRUE,
+  fill_mode = "nearest"
+)
+
+test_datagen <- image_data_generator(rescale = 1./255)
+# Validation data shouldnt be augmented
+
+train_generator <- flow_images_from_directory(
+  train_directory,
+  train_datagen,
+  target_size = c(150,150),
+  batch_size = 64,
+  class_mode = "categorical"
+)
+
+# Found 5599 images belonging to 2031 classes
+
+validation_generator <- flow_images_from_directory(
+  validation_directory,
+  test_datagen,
+  target_size = c(150, 150),
+  batch_size = 64,
+  class_mode = "categorical"
+)
+# Found 2031 images belonging to 2031 classes
+```
+
+
+## Training the model
+```{r}
+# Use categorical crossentropy for a loss functions since we have 2031 unique classes
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = c("accuracy")
+)
+
+# Train the model with 20 epocs with 100 steps for the training data
+history <- model %>% fit_generator(
+  train_generator,
+  steps_per_epoch = 100,
+  epochs = 20,
+  validation_data = validation_generator,
+  validation_steps = 50
+)
+
+```
+
+## Prepare to evaluate on test set - attain the csv file that needs to be uploaded to Kaggle
+
+## Create the relevant test directory
+
+```{r}
+test_dir <- "~/test"
+test_datagen <- image_data_generator(rescale = 1./255) 
+
+new_directory <- "~/test_directory"
+dir.create(new_directory)
+
+files <- list.files(path = test_dir, full.names = TRUE)
+length(files) # 15610
+newdir <- "~/test_directory/test"
+dir.create(newdir)
+
+files_new <- gsub(dirname(files[1]), newdir, files)
+
+for (i in 1:length(files)) {
+  
+  file.copy(files[i], files_new[i])
+}
+
+
+Images <- list.files(path = newdir, full.names = FALSE) # 15610 elements
+files_dt <- data.table(Images)
+#str(files_dt)
+
+```
+
+
+## Check accuracy on test set, create csv
+
+```{r}
+test_generator <- flow_images_from_directory(
+  new_directory,
+  test_datagen,
+  target_size = c(150, 150),
+  batch_size = 223,
+  class_mode = "categorical"
+)
+
+# Predict the model using the test generator
+pred <- model %>% predict_generator(test_generator, steps = 70)
+nrow(pred) # rows = 15610 and columns = 2031 (unique whale Ids)
+
+pred_dt <- data.table(pred)
+
+# Ordered whale ids from the train generator - already have them
+whale_id_indexes <- ldply (train_generator$class_indices, data.frame)
+ordered_whale_id_ind <- whale_id_indexes[order(whale_id_indexes$X..i..),]
+
+ID <- as.vector(ordered_whale_id_ind$.id)
+#ID
+
+# Rename the columns names
+names(pred_dt) <- ID
+
+# Now we have the whale ids as column names and the images as rows
+# Order and pick top 5
+# image name to be added in the pred_dt
+# use files_dt already created
+
+combined_dt <- cbind(files_dt,pred_dt)
+
+pred_long <- gather(combined_dt, whale_id, probabilities, new_whale:w_ffda8b2, factor_key=TRUE)
+
+# need to perform group by images and pick top 5
+
+top5_prob <- pred_long %>% group_by(Images) %>% top_n(5, probabilities) %>% arrange(Images)
+
+top5_prob_labels <- top5_prob[,1:2]  
+
+test_images_pred <- aggregate(whale_id ~ Images, 
+                              data = top5_prob_labels, paste, collapse = " ")
+# Check the output
+#test_images_pred[1:10,1:2]
+
+# export as csv file!
+#write.csv(test_images_pred, file = "vgg16_predictions.csv",row.names=FALSE)
+
+
+```
+
+## Accuracy of VGG16 with add. layers on test set according to Kaggle -  0.31160
+
+
+*Check whether an improvement could be reached by employing a CNN model.*
+
+## CNN model creation
+
+```{r}
+# Start with data augmentation again
+train_datagen = image_data_generator(
+  rescale = 1./255,
+  rotation_range = 30,
+  width_shift_range = 0.3,
+  height_shift_range = 0.3,
+  shear_range = 0.3,
+  zoom_range = 0.3,
+  horizontal_flip = TRUE
+  #fill_mode = "nearest"
+)
+
+test_datagen <- image_data_generator(rescale = 1./255)
+
+# Validation data shouldnt be augmented
+
+train_generator <- flow_images_from_directory(
+  train_directory,
+  train_datagen,
+  target_size = c(150,150),
+  batch_size = 16,
+  class_mode = "categorical"
+)
+
+# Found 5599 images belonging to 2031 classes
+
+validation_generator <- flow_images_from_directory(
+  validation_directory,
+  test_datagen,
+  target_size = c(150, 150),
+  batch_size = 16,
+  class_mode = "categorical"
+)
+# Found 2031 images belonging to 2031 classes
+
+# Build a CNN model with 2 conv & 2 pooling layers, flatten the output and then 
+# finish with a dense layer with 2031 units (nb of unique whale ids)
+model_cnn <- keras_model_sequential() %>%
+  layer_conv_2d( input_shape = c(150, 150, 3), filter = 32, kernel_size = c(3, 3), 
+                 activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filter = 64, kernel_size = c(3, 3), activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>% 
+  layer_flatten() %>%
+  layer_dense(2031, activation = "softmax")
+summary(model_cnn)
+
+# use adamax as an optimization method and cross-entropy as a loss function
+model_cnn %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adamax(lr = 0.0001, decay = 1e-6),
+  metrics = "accuracy"
+)
+
+# Train the model
+history_cnn <- model_cnn %>% fit_generator(
+  train_generator,
+  steps_per_epoch = 100,
+  epochs = 30,
+  validation_data = validation_generator,
+  validation_steps = 25
+  )
+
+
+```
+
+
+## Check performance of CNN model on the test set, i.e. get to the required format csv
+
+```{r}
+# inititate the test generator again
+test_generator <- flow_images_from_directory(
+  new_directory,
+  test_datagen,
+  target_size = c(150, 150),
+  batch_size = 223,
+  class_mode = "categorical"
+)
+# Found 15610 images belonging to 1 classes.
+
+pred <- model_cnn %>% predict_generator(test_generator, steps = 70)
+
+pred_dt <- data.table(pred)
+
+# Get the indexes of the whale ids
+whale_id_indexes <- ldply (train_generator$class_indices, data.frame)
+# order them in a increasing manner
+ordered_whale_id_ind <- whale_id_indexes[order(whale_id_indexes$X..i..),]
+
+ID <- as.vector(ordered_whale_id_ind$.id)
+
+# Rename the columns with the relevant whale ids
+names(pred_dt) <- ID
+
+# Now we have the whale ids as column names and rows as the images
+# Order and pick top 5
+# image name to be added in the pred_dt
+# use files_dt
+
+combined_dt <- cbind(files_dt,pred_dt)
+
+# transform from a wide to long format so that we can group by and pick the top 5 probabilities
+pred_long <- gather(combined_dt, whale_id, probabilities, new_whale:w_ffda8b2, factor_key=TRUE)
+
+top5_prob <- pred_long %>% group_by(Images) %>% top_n(5, probabilities) %>% arrange(Images)
+top5_prob[1:10,1:3]
+
+top5_prob_labels <- top5_prob[,1:2]  
+
+test_images_pred <- aggregate(whale_id ~ Images, 
+                              data = top5_prob_labels, paste, collapse = " ")
+
+test_images_pred[1:10,1:2]
+
+# export as csv file!
+#write.csv(test_images_pred, file = "cnn_predictions.csv",row.names=FALSE)
+
+
+```
+
+
+### Accuracy of the CNN model on test set acording to Kaggle -  0.32716
+### Better performing model than the VGG16
+### Place in the leaderboard - 336 out of 453
+### Username: Nadia Gesheva
+
+### *Conclusion: Convnets are a great type of machine-learning models for computer-vision tasks.*
